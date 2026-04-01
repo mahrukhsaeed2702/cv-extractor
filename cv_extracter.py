@@ -100,11 +100,15 @@ def extract_fields_with_groq(client: Groq, cv_text: str) -> dict:
     raw = response.choices[0].message.content.strip()
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
+    
     try:
-        return json.loads(raw)
+        result = json.loads(raw)
+        # Ensure result is always a dict, never a string
+        if not isinstance(result, dict):
+            return {}
+        return result
     except json.JSONDecodeError:
         return {}
-
 
 def build_excel(rows: list[dict]) -> bytes:
     wb = Workbook()
