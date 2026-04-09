@@ -5,12 +5,14 @@ Usage:
     streamlit run cv_extractor_app.py
 
 Requirements:
-    pip install streamlit pdfplumber groq openpyxl
+    pip install streamlit pdfplumber groq openpyxl python-doctr[tf] pdf2image pillow
 """
 
 import io
+import os
 import json
 import re
+import tempfile
 
 import pdfplumber
 from groq import Groq
@@ -47,11 +49,11 @@ Return ONLY a valid JSON object with exactly these keys:
 - Email Address 
 - Phone Number
 - Address (Address of city, country or maybe only city like Lahore)
-- Highest Degree (If it is in progress or expected to end soon mention it. Also mention the name of university of degree)
+- Highest Degree (If it is in progress or expected to end soon mention it)
 - University Name (Name of the university where the highest degree was obtained or is in progress)
 - Degree Title (It should be like BS or MS with degree name CS,DS,IT,SE etc)
 - GPA
-- Specialization (If mentioned in profile  first paragraph mostly like frontend, backend, full stack engineer, AI engineer or ML engineer or combination, any type of manager, web based engineer or developer , any type of developer ;otherwise null)
+- Specialization (If mentioned in profile first paragraph mostly like frontend, backend, full stack engineer, AI engineer or ML engineer or combination, any type of manager, web based engineer or developer, any type of developer; otherwise null)
 - Skills / Tech Stack  (comma-separated list)
 - Certifications       (complete detail in comma-separated list)
 - Experience           (brief summary of all experiences with tenure and not forget to mention name of company where did the experience)
@@ -75,16 +77,56 @@ COL_WIDTHS = {
     "Experience": 45, "Position Applied For": 25, "Filename": 30,
 }
 
+# ── Doctr OCR Model (loaded once, cached) ─────────────────────────────────────
+
+@st.cache_resource
+def load_ocr_model():
+    from doctr.models import ocr_predictor
+    return ocr_predictor(pretrained=True)
+
+
 # ── Core Functions ────────────────────────────────────────────────────────────
 
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
+    """Try pdfplumber first. If no text found (scanned PDF), fall back to Doctr OCR."""
+
+    # Step 1: pdfplumber — fast, works for text-based PDFs
     text_parts = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
             page_text = page.extract_text()
             if page_text:
                 text_parts.append(page_text)
-    return "\n".join(text_parts).strip()
+
+    text = "\n".join(text_parts).strip()
+
+    # Step 2: Doctr OCR — for scanned/CamScanner PDFs
+    if not text:
+        from doctr.io import DocumentFile
+
+        model = load_ocr_model()
+
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            tmp.write(pdf_bytes)
+            tmp_path = tmp.name
+
+        try:
+            doc         = DocumentFile.from_pdf(tmp_path)
+            result      = model(doc)
+            json_output = result.export()
+
+            ocr_parts = []
+            for page in json_output["pages"]:
+                for block in page["blocks"]:
+                    for line in block["lines"]:
+                        line_text = " ".join([word["value"] for word in line["words"]])
+                        ocr_parts.append(line_text)
+
+            text = "\n".join(ocr_parts).strip()
+        finally:
+            os.unlink(tmp_path)
+
+    return text
 
 
 def extract_fields_with_groq(client: Groq, cv_text: str) -> dict:
@@ -100,15 +142,14 @@ def extract_fields_with_groq(client: Groq, cv_text: str) -> dict:
     raw = response.choices[0].message.content.strip()
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
-    
     try:
         result = json.loads(raw)
-        # Ensure result is always a dict, never a string
         if not isinstance(result, dict):
             return {}
         return result
     except json.JSONDecodeError:
         return {}
+
 
 def build_excel(rows: list[dict]) -> bytes:
     wb = Workbook()
@@ -157,12 +198,15 @@ with st.sidebar:
     st.markdown("Extract structured data from PDF resumes and export to Excel.")
     st.divider()
     st.caption("**Fields extracted:**")
-    for f in FIELDS[:-1]:  # skip Filename
+    for f in FIELDS[:-1]:
         st.caption(f"• {f}")
+    st.divider()
+    st.caption("🔍 Text-based PDFs → pdfplumber")
+    st.caption("🖼️ Scanned PDFs → Doctr OCR")
 
 # ── Main Area ─────────────────────────────────────────────────────────────────
 st.header("📂 Upload PDF Resumes")
-st.markdown("Upload one or more CV/resume PDFs. They will be processed in batch and exported as a single Excel file.")
+st.markdown("Upload one or more CV/resume PDFs — both text-based and scanned (CamScanner) are supported.")
 
 uploaded_files = st.file_uploader(
     "Drop PDFs here or click to browse",
@@ -213,7 +257,7 @@ if run_btn and uploaded_files:
 
             if not cv_text:
                 with log_expander:
-                    log_ph.warning(f"⚠️ {name} — No text found (may be a scanned image PDF)")
+                    log_ph.warning(f"⚠️ {name} — No text found even after OCR")
                 extracted = {}
             else:
                 status_box.info(f"🤖 Calling Groq LLM for **{name}**…")
@@ -243,14 +287,12 @@ if run_btn and uploaded_files:
     progress_bar.progress(100, text="Done!")
     status_box.empty()
 
-    # ── Results — all fields ──────────────────────────────────────────────────
+    # ── Results ───────────────────────────────────────────────────────────────
     st.divider()
     st.subheader(f"✅ Results — {len(rows)} CV(s) processed")
 
-    # Show ALL fields in the preview table
     st.dataframe(rows, use_container_width=True)
 
-    # Download button
     xlsx_bytes = build_excel(rows)
     st.download_button(
         label="⬇️ Download Excel File",
