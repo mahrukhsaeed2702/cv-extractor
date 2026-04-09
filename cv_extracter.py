@@ -88,45 +88,29 @@ def load_ocr_model():
 # ── Core Functions ────────────────────────────────────────────────────────────
 
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
-    """Try pdfplumber first. If no text found (scanned PDF), fall back to Doctr OCR."""
+    from doctr.io import DocumentFile
 
-    # Step 1: pdfplumber — fast, works for text-based PDFs
-    text_parts = []
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for page in pdf.pages:
-            page_text = page.extract_text()
-            if page_text:
-                text_parts.append(page_text)
+    model = load_ocr_model()
 
-    text = "\n".join(text_parts).strip()
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+        tmp.write(pdf_bytes)
+        tmp_path = tmp.name
 
-    # Step 2: Doctr OCR — for scanned/CamScanner PDFs
-    if not text:
-        from doctr.io import DocumentFile
+    try:
+        doc         = DocumentFile.from_pdf(tmp_path)
+        result      = model(doc)
+        json_output = result.export()
 
-        model = load_ocr_model()
+        ocr_parts = []
+        for page in json_output["pages"]:
+            for block in page["blocks"]:
+                for line in block["lines"]:
+                    line_text = " ".join([word["value"] for word in line["words"]])
+                    ocr_parts.append(line_text)
 
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-            tmp.write(pdf_bytes)
-            tmp_path = tmp.name
-
-        try:
-            doc         = DocumentFile.from_pdf(tmp_path)
-            result      = model(doc)
-            json_output = result.export()
-
-            ocr_parts = []
-            for page in json_output["pages"]:
-                for block in page["blocks"]:
-                    for line in block["lines"]:
-                        line_text = " ".join([word["value"] for word in line["words"]])
-                        ocr_parts.append(line_text)
-
-            text = "\n".join(ocr_parts).strip()
-        finally:
-            os.unlink(tmp_path)
-
-    return text
+        return "\n".join(ocr_parts).strip()
+    finally:
+        os.unlink(tmp_path)
 
 
 def extract_fields_with_groq(client: Groq, cv_text: str) -> dict:
