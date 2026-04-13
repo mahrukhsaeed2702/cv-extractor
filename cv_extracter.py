@@ -27,20 +27,10 @@ GROQ_MODEL   = "llama-3.1-8b-instant"
 MAX_TOKENS   = 2048
 
 FIELDS = [
-    "Name",
-    "Email Address",
-    "Phone Number",
-    "Address",
-    "Highest Degree",
-    "University Name",
-    "Degree Title",
-    "GPA",
-    "Specialization",
-    "Skills / Tech Stack",
-    "Certifications",
-    "Experience",
-    "Position Applied For",
-    "Filename",
+    "Name", "Email Address", "Phone Number", "Address",
+    "Highest Degree", "University Name", "Degree Title", "GPA",
+    "Specialization", "Skills / Tech Stack", "Certifications",
+    "Experience", "Position Applied For", "Filename",
 ]
 
 SYSTEM_PROMPT = """You are a CV/resume parser. Extract structured information from the provided resume text.
@@ -48,16 +38,16 @@ Return ONLY a valid JSON object with exactly these keys:
 - Name
 - Email Address 
 - Phone Number
-- Address (Address of city, country or maybe only city like Lahore)
-- Highest Degree (If it is in progress or expected to end soon mention it)
-- University Name (Name of the university where the highest degree was obtained or is in progress)
-- Degree Title (It should be like BS or MS with degree name CS,DS,IT,SE etc)
+- Address (city, country or just city like Lahore)
+- Highest Degree (mention if in progress or expected)
+- University Name (where highest degree was obtained or is in progress)
+- Degree Title (like BS/MS with field e.g. CS, DS, IT, SE)
 - GPA
-- Specialization (If mentioned in profile first paragraph mostly like frontend, backend, full stack engineer, AI engineer or ML engineer or combination, any type of manager, web based engineer or developer, any type of developer; otherwise null)
-- Skills / Tech Stack  (comma-separated list)
-- Certifications       (complete detail in comma-separated list)
-- Experience           (brief summary of all experiences with tenure and not forget to mention name of company where did the experience)
-- Position Applied For (if clearly mentioned otherwise null)
+- Specialization (frontend, backend, full stack, AI/ML engineer, type of manager, etc.; null if not mentioned)
+- Skills / Tech Stack (comma-separated list)
+- Certifications (complete detail, comma-separated)
+- Experience (brief summary of all roles with tenure and company names)
+- Position Applied For (if clearly stated, otherwise null)
 
 If a field is not found, use an empty string "".
 Do NOT include any explanation or markdown — pure JSON only."""
@@ -77,9 +67,9 @@ COL_WIDTHS = {
     "Experience": 45, "Position Applied For": 25, "Filename": 30,
 }
 
-# ── Doctr OCR Model (loaded once, cached) ─────────────────────────────────────
+# ── OCR Model (loaded once, cached) ───────────────────────────────────────────
 
-@st.cache_resource
+@st.cache_resource(show_spinner="Loading OCR model (first time only)...")
 def load_ocr_model():
     from doctr.models import ocr_predictor
     return ocr_predictor(pretrained=True)
@@ -87,16 +77,30 @@ def load_ocr_model():
 
 # ── Core Functions ────────────────────────────────────────────────────────────
 
-def extract_text_from_pdf(pdf_bytes: bytes) -> str:
+def extract_text_pdfplumber(pdf_bytes: bytes) -> str:
+    """Fast path: extract text from text-based PDFs using pdfplumber."""
+    text_parts = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text()
+            if text:
+                text_parts.append(text.strip())
+    return "\n".join(text_parts).strip()
+
+
+def extract_text_ocr(pdf_bytes: bytes) -> str:
+    """Slow path: OCR for scanned/image-based PDFs using Doctr."""
     from doctr.io import DocumentFile
 
     model = load_ocr_model()
 
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-        tmp.write(pdf_bytes)
-        tmp_path = tmp.name
-
+    # Use delete=False + manual cleanup so we control when the file is released
+    tmp_path = None
     try:
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            tmp.write(pdf_bytes)
+            tmp_path = tmp.name
+
         doc         = DocumentFile.from_pdf(tmp_path)
         result      = model(doc)
         json_output = result.export()
@@ -105,33 +109,52 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
         for page in json_output["pages"]:
             for block in page["blocks"]:
                 for line in block["lines"]:
-                    line_text = " ".join([word["value"] for word in line["words"]])
+                    line_text = " ".join(w["value"] for w in line["words"])
                     ocr_parts.append(line_text)
 
         return "\n".join(ocr_parts).strip()
+
     finally:
-        os.unlink(tmp_path)
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass  # best-effort cleanup
+
+
+def extract_text_from_pdf(pdf_bytes: bytes, filename: str = "") -> tuple[str, str]:
+    """
+    Try pdfplumber first (fast, no ML).
+    Fall back to Doctr OCR only if the extracted text is too short
+    (indicates a scanned / image-only PDF).
+    Returns (text, method_used).
+    """
+    text = extract_text_pdfplumber(pdf_bytes)
+
+    if len(text) >= 50:
+        return text, "pdfplumber"
+
+    # Scanned PDF — use OCR
+    text = extract_text_ocr(pdf_bytes)
+    return text, "OCR"
 
 
 def extract_fields_with_groq(client: Groq, cv_text: str) -> dict:
     prompt = f"Resume Text:\n\n{cv_text[:6000]}"
-    response = client.chat.completions.create(
-        model=GROQ_MODEL,
-        max_tokens=MAX_TOKENS,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": prompt},
-        ],
-    )
-    raw = response.choices[0].message.content.strip()
-    raw = re.sub(r"^```(?:json)?\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw)
     try:
-        result = json.loads(raw)
-        if not isinstance(result, dict):
-            return {}
-        return result
-    except json.JSONDecodeError:
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            max_tokens=MAX_TOKENS,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user",   "content": prompt},
+            ],
+        )
+        raw = response.choices[0].message.content.strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        return json.loads(raw) if isinstance(json.loads(raw), dict) else {}
+    except Exception:
         return {}
 
 
@@ -169,13 +192,8 @@ def build_excel(rows: list[dict]) -> bytes:
 
 # ── Streamlit UI ──────────────────────────────────────────────────────────────
 
-st.set_page_config(
-    page_title="CV Extractor",
-    page_icon="📄",
-    layout="wide",
-)
+st.set_page_config(page_title="CV Extractor", page_icon="📄", layout="wide")
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.image("https://img.icons8.com/fluency/96/resume.png", width=72)
     st.title("CV Extractor")
@@ -185,10 +203,9 @@ with st.sidebar:
     for f in FIELDS[:-1]:
         st.caption(f"• {f}")
     st.divider()
-    st.caption("🔍 Text-based PDFs → pdfplumber")
-    st.caption("🖼️ Scanned PDFs → Doctr OCR")
+    st.caption("🔍 Text-based PDFs → pdfplumber (fast)")
+    st.caption("🖼️ Scanned PDFs → Doctr OCR (fallback)")
 
-# ── Main Area ─────────────────────────────────────────────────────────────────
 st.header("📂 Upload PDF Resumes")
 st.markdown("Upload one or more CV/resume PDFs — both text-based and scanned (CamScanner) are supported.")
 
@@ -215,6 +232,7 @@ if not uploaded_files:
     st.info("Upload at least one PDF resume above to get started.")
 
 # ── Processing ────────────────────────────────────────────────────────────────
+
 if run_btn and uploaded_files:
     client = Groq(api_key=GROQ_API_KEY)
     rows   = []
@@ -236,18 +254,18 @@ if run_btn and uploaded_files:
             log_ph.markdown(f"**→ {name}**")
 
         try:
-            pdf_bytes = uploaded_file.read()
-            cv_text   = extract_text_from_pdf(pdf_bytes)
+            pdf_bytes        = uploaded_file.read()
+            cv_text, method  = extract_text_from_pdf(pdf_bytes, name)
 
             if not cv_text:
                 with log_expander:
                     log_ph.warning(f"⚠️ {name} — No text found even after OCR")
                 extracted = {}
             else:
-                status_box.info(f"🤖 Calling Groq LLM for **{name}**…")
+                status_box.info(f"🤖 Calling Groq LLM for **{name}** (via {method})…")
                 extracted = extract_fields_with_groq(client, cv_text)
                 with log_expander:
-                    log_ph.success(f"✅ {name} — Extracted successfully")
+                    log_ph.success(f"✅ {name} — Extracted via {method}")
 
         except Exception as e:
             with log_expander:
@@ -271,10 +289,8 @@ if run_btn and uploaded_files:
     progress_bar.progress(100, text="Done!")
     status_box.empty()
 
-    # ── Results ───────────────────────────────────────────────────────────────
     st.divider()
     st.subheader(f"✅ Results — {len(rows)} CV(s) processed")
-
     st.dataframe(rows, use_container_width=True)
 
     xlsx_bytes = build_excel(rows)
