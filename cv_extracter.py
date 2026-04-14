@@ -1,20 +1,23 @@
 """
-CV to Excel Extractor — Streamlit App
---------------------------------------
+CV to Excel Extractor — Streamlit App (Tesseract OCR)
+------------------------------------------------------
 Usage:
     streamlit run cv_extractor_app.py
 
 Requirements:
-    pip install streamlit pdfplumber groq openpyxl python-doctr[tf] pdf2image pillow
+    pip install streamlit pdfplumber groq openpyxl pdf2image pillow pytesseract
+    System: sudo apt-get install tesseract-ocr poppler-utils
 """
 
 import io
 import os
 import json
 import re
-import tempfile
 
 import pdfplumber
+import pytesseract
+from pdf2image import convert_from_bytes
+from PIL import Image
 from groq import Groq
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
@@ -27,16 +30,26 @@ GROQ_MODEL   = "llama-3.1-8b-instant"
 MAX_TOKENS   = 2048
 
 FIELDS = [
-    "Name", "Email Address", "Phone Number", "Address",
-    "Highest Degree", "University Name", "Degree Title", "GPA",
-    "Specialization", "Skills / Tech Stack", "Certifications",
-    "Experience", "Position Applied For", "Filename",
+    "Name",
+    "Email Address",
+    "Phone Number",
+    "Address",
+    "Highest Degree",
+    "University Name",
+    "Degree Title",
+    "GPA",
+    "Specialization",
+    "Skills / Tech Stack",
+    "Certifications",
+    "Experience",
+    "Position Applied For",
+    "Filename",
 ]
 
 SYSTEM_PROMPT = """You are a CV/resume parser. Extract structured information from the provided resume text.
 Return ONLY a valid JSON object with exactly these keys:
 - Name
-- Email Address 
+- Email Address
 - Phone Number
 - Address (city, country or just city like Lahore)
 - Highest Degree (mention if in progress or expected)
@@ -67,96 +80,66 @@ COL_WIDTHS = {
     "Experience": 45, "Position Applied For": 25, "Filename": 30,
 }
 
-# ── OCR Model (loaded once, cached) ───────────────────────────────────────────
-
-@st.cache_resource(show_spinner="Loading OCR model (first time only)...")
-def load_ocr_model():
-    from doctr.models import ocr_predictor
-    return ocr_predictor(pretrained=True)
-
-
-# ── Core Functions ────────────────────────────────────────────────────────────
+# ── Text Extraction ───────────────────────────────────────────────────────────
 
 def extract_text_pdfplumber(pdf_bytes: bytes) -> str:
-    """Fast path: extract text from text-based PDFs using pdfplumber."""
-    text_parts = []
+    """Fast path for text-based PDFs."""
+    parts = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
             text = page.extract_text()
             if text:
-                text_parts.append(text.strip())
-    return "\n".join(text_parts).strip()
+                parts.append(text.strip())
+    return "\n".join(parts).strip()
 
 
-def extract_text_ocr(pdf_bytes: bytes) -> str:
-    """Slow path: OCR for scanned/image-based PDFs using Doctr."""
-    from doctr.io import DocumentFile
-
-    model = load_ocr_model()
-
-    # Use delete=False + manual cleanup so we control when the file is released
-    tmp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-            tmp.write(pdf_bytes)
-            tmp_path = tmp.name
-
-        doc         = DocumentFile.from_pdf(tmp_path)
-        result      = model(doc)
-        json_output = result.export()
-
-        ocr_parts = []
-        for page in json_output["pages"]:
-            for block in page["blocks"]:
-                for line in block["lines"]:
-                    line_text = " ".join(w["value"] for w in line["words"])
-                    ocr_parts.append(line_text)
-
-        return "\n".join(ocr_parts).strip()
-
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass  # best-effort cleanup
+def extract_text_tesseract(pdf_bytes: bytes) -> str:
+    """OCR path for scanned/image-based PDFs (CamScanner etc.)."""
+    images = convert_from_bytes(pdf_bytes, dpi=300)
+    parts  = []
+    for img in images:
+        text = pytesseract.image_to_string(img, lang="eng")
+        if text.strip():
+            parts.append(text.strip())
+    return "\n".join(parts).strip()
 
 
-def extract_text_from_pdf(pdf_bytes: bytes, filename: str = "") -> tuple[str, str]:
+def extract_text_from_pdf(pdf_bytes: bytes) -> tuple[str, str]:
     """
-    Try pdfplumber first (fast, no ML).
-    Fall back to Doctr OCR only if the extracted text is too short
-    (indicates a scanned / image-only PDF).
+    Try pdfplumber first (fast).
+    Fall back to Tesseract OCR if text is too short (scanned PDF).
     Returns (text, method_used).
     """
     text = extract_text_pdfplumber(pdf_bytes)
-
     if len(text) >= 50:
         return text, "pdfplumber"
 
-    # Scanned PDF — use OCR
-    text = extract_text_ocr(pdf_bytes)
-    return text, "OCR"
+    text = extract_text_tesseract(pdf_bytes)
+    return text, "Tesseract OCR"
 
+
+# ── Groq Extraction ───────────────────────────────────────────────────────────
 
 def extract_fields_with_groq(client: Groq, cv_text: str) -> dict:
-    prompt = f"Resume Text:\n\n{cv_text[:6000]}"
     try:
         response = client.chat.completions.create(
             model=GROQ_MODEL,
             max_tokens=MAX_TOKENS,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user",   "content": prompt},
+                {"role": "user",   "content": f"Resume Text:\n\n{cv_text[:6000]}"},
             ],
         )
         raw = response.choices[0].message.content.strip()
         raw = re.sub(r"^```(?:json)?\s*", "", raw)
         raw = re.sub(r"\s*```$", "", raw)
-        return json.loads(raw) if isinstance(json.loads(raw), dict) else {}
+        result = json.loads(raw)
+        return result if isinstance(result, dict) else {}
     except Exception:
         return {}
 
+
+# ── Excel Builder ─────────────────────────────────────────────────────────────
 
 def build_excel(rows: list[dict]) -> bytes:
     wb = Workbook()
@@ -184,7 +167,6 @@ def build_excel(rows: list[dict]) -> bytes:
         ws.column_dimensions[ws.cell(1, col_idx).column_letter].width = COL_WIDTHS.get(field, 20)
 
     ws.freeze_panes = "A2"
-
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
@@ -204,7 +186,7 @@ with st.sidebar:
         st.caption(f"• {f}")
     st.divider()
     st.caption("🔍 Text-based PDFs → pdfplumber (fast)")
-    st.caption("🖼️ Scanned PDFs → Doctr OCR (fallback)")
+    st.caption("🖼️ Scanned PDFs → Tesseract OCR (fallback)")
 
 st.header("📂 Upload PDF Resumes")
 st.markdown("Upload one or more CV/resume PDFs — both text-based and scanned (CamScanner) are supported.")
@@ -254,18 +236,18 @@ if run_btn and uploaded_files:
             log_ph.markdown(f"**→ {name}**")
 
         try:
-            pdf_bytes        = uploaded_file.read()
-            cv_text, method  = extract_text_from_pdf(pdf_bytes, name)
+            pdf_bytes       = uploaded_file.read()
+            cv_text, method = extract_text_from_pdf(pdf_bytes)
 
             if not cv_text:
                 with log_expander:
-                    log_ph.warning(f"⚠️ {name} — No text found even after OCR")
+                    log_ph.warning(f"⚠️ {name} — No text found")
                 extracted = {}
             else:
                 status_box.info(f"🤖 Calling Groq LLM for **{name}** (via {method})…")
                 extracted = extract_fields_with_groq(client, cv_text)
                 with log_expander:
-                    log_ph.success(f"✅ {name} — Extracted via {method}")
+                    log_ph.success(f"✅ {name} — Done via {method}")
 
         except Exception as e:
             with log_expander:
